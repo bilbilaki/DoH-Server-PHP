@@ -1,7 +1,30 @@
 <?php
 
+/**
+ * DNS Multi-Protocol Proxy
+ * * Supports: 
+ * - DNS-over-UDP (Port 53)
+ * - DNS-over-TCP (Port 53)
+ * - DNS-over-TLS (Port 853)
+ * - Proxies all to DoH Upstreams
+ */
+
+// Configuration
+$config = [
+    'udp_port'     => 53,
+    'tcp_port'     => 53,
+    'dot_port'     => 853,
+    'listen_ip'    => '0.0.0.0',
+    'cache_ttl'    => 600,
+    'timeout'      => 4,
+    'batch_size'   => 3,
+    // Paths for DoT SSL (Required for Port 853)
+    'ssl_cert'     => '/path/to/fullchain.pem', 
+    'ssl_key'      => '/path/to/privkey.pem',
+];
+
 $upstreams = [
-    "https://1.0.0.1/dns-query",
+     "https://1.0.0.1/dns-query",
     "https://8.8.4.4/dns-query",
     "https://208.67.220.220/dns-query",
     "https://dns.nextdns.io/dns-query",
@@ -18,162 +41,134 @@ $upstreams = [
     "https://sky.rethinkdns.com/dns-query"
 ];
 
-$cache_ttl = 600;
-$batch_size = 3;
-
-function now_ms()
-{
-    return (int) round(microtime(true) * 1000);
+if (php_sapi_name() !== 'cli') {
+    die("This script must be run from the CLI (command line).\n");
 }
 
-function error_json($code, $message)
-{
-    http_response_code($code);
-    header("Content-Type: application/json");
-    echo json_encode(
-        [
-            "error" => [
-                "timestamp" => now_ms(),
-                "code" => $code,
-                "message" => $message,
-            ],
-        ],
-        JSON_UNESCAPED_UNICODE
-    );
-    exit();
-}
+/**
+ * Resolves a DNS binary message via DoH upstreams
+ */
+function resolve_via_doh($dns_wire_data) {
+    global $upstreams, $config;
+    
+    $shuffled = $upstreams;
+    shuffle($shuffled);
+    $batch = array_slice($shuffled, 0, $config['batch_size']);
 
-$method = $_SERVER["REQUEST_METHOD"] ?? "GET";
-if (!in_array($method, ["GET", "POST"])) {
-    error_json(405, "Method Not Allowed: only GET/POST supported");
-}
-
-$extra_query = "";
-if ($method === "GET") {
-    if (!empty($_SERVER["QUERY_STRING"])) {
-        parse_str($_SERVER["QUERY_STRING"], $params);
-        if ($params) {
-            $extra_query = "?" . http_build_query($params);
-        }
-    } else {
-        error_json(400, "Bad Request: GET must include query parameters");
-    }
-}
-
-$body = file_get_contents("php://input");
-$cache_key = "doh_" . md5($method . ":" . $extra_query . ":" . $body);
-
-if (function_exists("apcu_fetch")) {
-    $cached = apcu_fetch($cache_key);
-    if ($cached !== false) {
-        header("Content-Type: application/dns-message");
-        echo $cached;
-        exit();
-    }
-}
-
-shuffle($upstreams);
-
-function query_batch(
-    array $batch,
-    string $method,
-    string $extra_query,
-    string $body,
-    int $cache_ttl,
-    string $cache_key
-) {
     $mh = curl_multi_init();
     $chs = [];
 
-    foreach ($batch as $up) {
-        $ch = curl_init($up . $extra_query);
+    foreach ($batch as $url) {
+        $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER => [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $dns_wire_data,
+            CURLOPT_HTTPHEADER     => [
                 "Content-Type: application/dns-message",
                 "Accept: application/dns-message",
             ],
-            CURLOPT_POSTFIELDS => $body,
-            CURLOPT_CUSTOMREQUEST => $method,
-            CURLOPT_TIMEOUT => 4,
-            CURLOPT_FORBID_REUSE => false,
-            CURLOPT_FRESH_CONNECT => false,
+            CURLOPT_TIMEOUT        => $config['timeout'],
+            CURLOPT_SSL_VERIFYPEER => true,
         ]);
         curl_multi_add_handle($mh, $ch);
-        $chs[(int) $ch] = $ch;
+        $chs[] = $ch;
     }
 
-    $running = null;
-    $first_failure = null;
-
+    $response = null;
     do {
         curl_multi_exec($mh, $running);
-
         while ($info = curl_multi_info_read($mh)) {
-            $ch = $info["handle"];
-            if (
-                $info["result"] === CURLE_OK &&
-                curl_getinfo($ch, CURLINFO_HTTP_CODE) === 200
-            ) {
-                $resp = curl_multi_getcontent($ch);
-                if (strlen($resp) >= 4) {
-                    $rcode = ord($resp[3]) & 0x0f;
-                } else {
-                    $rcode = 2;
-                }
-
-                if ($rcode === 0) {
-                    if (function_exists("apcu_store")) {
-                        apcu_store($cache_key, $resp, $cache_ttl);
-                    }
-                    header("Content-Type: application/dns-message");
-                    echo $resp;
-
-                    foreach ($chs as $c) {
-                        curl_multi_remove_handle($mh, $c);
-                        curl_close($c);
-                    }
-                    curl_multi_close($mh);
-                    exit();
-                } else {
-                    if ($first_failure === null) {
-                        $first_failure = $resp;
-                    }
+            $handle = $info['handle'];
+            if ($info['result'] === CURLE_OK && curl_getinfo($handle, CURLINFO_HTTP_CODE) === 200) {
+                $temp = curl_multi_getcontent($handle);
+                if ($temp && strlen($temp) > 12) { // Valid DNS header length
+                    $response = $temp;
+                    break 2; 
                 }
             }
-            curl_multi_remove_handle($mh, $ch);
-            curl_close($ch);
-            unset($chs[(int) $ch]);
         }
-
-        if ($running) {
-            curl_multi_select($mh, 0.1);
-        }
+        if ($running) curl_multi_select($mh, 0.1);
     } while ($running);
 
-    curl_multi_close($mh);
-    return $first_failure;
-}
-
-$first_failure = null;
-for ($i = 0; $i < count($upstreams); $i += $batch_size) {
-    $batch = array_slice($upstreams, $i, $batch_size);
-    $res = query_batch(
-        $batch,
-        $method,
-        $extra_query,
-        $body,
-        $cache_ttl,
-        $cache_key
-    );
-    if ($res !== null) {
-        if (function_exists("apcu_store")) {
-            apcu_store($cache_key, $res, $cache_ttl);
-        }
-        header("Content-Type: application/dns-message");
-        echo $res;
-        exit();
+    foreach ($chs as $ch) {
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
     }
+    curl_multi_close($mh);
+
+    return $response;
 }
 
-error_json(502, "All upstream DoH failed");
+// 1. Setup UDP Socket (Standard DNS)
+$udp_socket = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+socket_bind($udp_socket, $config['listen_ip'], $config['udp_port']);
+socket_set_nonblock($udp_socket);
+
+// 2. Setup TCP Socket (Standard DNS)
+$tcp_socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
+socket_set_option($tcp_socket, SOL_SOCKET, SO_REUSEADDR, 1);
+socket_bind($tcp_socket, $config['listen_ip'], $config['tcp_port']);
+socket_listen($tcp_socket);
+socket_set_nonblock($tcp_socket);
+
+// 3. Setup DoT Socket (TLS)
+// Note: Requires valid certs. For testing, you might need a stream_context approach instead of raw sockets.
+$dot_ctx = stream_context_create([
+    'ssl' => [
+        'local_cert' => $config['ssl_cert'],
+        'local_pk'   => $config['ssl_key'],
+        'verify_peer' => false,
+    ]
+]);
+$dot_server = @stream_socket_server(
+    "tls://{$config['listen_ip']}:{$config['dot_port']}", 
+    $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $dot_ctx
+);
+if ($dot_server) stream_set_blocking($dot_server, false);
+
+echo "DNS Proxy started...\nUDP: {$config['udp_port']}\nTCP: {$config['tcp_port']}\nDoT: {$config['dot_port']}\n";
+
+// Main Loop
+while (true) {
+    // Handle UDP
+    $buf = "";
+    $from = "";
+    $port = 0;
+    if (@socket_recvfrom($udp_socket, $buf, 512, 0, $from, $port)) {
+        $res = resolve_via_doh($buf);
+        if ($res) socket_sendto($udp_socket, $res, strlen($res), 0, $from, $port);
+    }
+
+    // Handle TCP
+    if ($client = @socket_accept($tcp_socket)) {
+        // DNS over TCP prefixes message with 2-byte length
+        $len_buf = socket_read($client, 2);
+        if ($len_buf) {
+            $len = unpack('n', $len_buf)[1];
+            $query = socket_read($client, $len);
+            $res = resolve_via_doh($query);
+            if ($res) {
+                $res_len = pack('n', strlen($res));
+                socket_write($client, $res_len . $res);
+            }
+        }
+        socket_close($client);
+    }
+
+    // Handle DoT (Simplified)
+    if ($dot_server && ($dot_client = @stream_socket_accept($dot_server, 0))) {
+        $len_buf = fread($dot_client, 2);
+        if ($len_buf) {
+            $len = unpack('n', $len_buf)[1];
+            $query = fread($dot_client, $len);
+            $res = resolve_via_doh($query);
+            if ($res) {
+                fwrite($dot_client, pack('n', strlen($res)) . $res);
+            }
+        }
+        fclose($dot_client);
+    }
+
+    usleep(5000); // Prevent CPU spiking
+}
